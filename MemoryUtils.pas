@@ -205,6 +205,7 @@ begin
 
                     if IsModuleLoaded(FDLLPath, FProcessID) then
                     begin
+                      Result := True;
                       CloseHandle(hThread);
                       Break;
                     end;
