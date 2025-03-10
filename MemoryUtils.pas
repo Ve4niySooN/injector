@@ -12,6 +12,8 @@ type
   private
     FProcessID: DWORD;
     FDLLPath: AnsiString;
+    WDllPath: WideString;
+    WDllName: WideString;
     FInjectType: INJECT_TYPE;
     function GetProcessID(ProcessName: string): DWORD;
     function IsModuleLoaded(ModulePath: ansistring; ProcessID: DWORD): Boolean;
@@ -22,7 +24,67 @@ type
 
 implementation
 
+function OpenThread(
+  dwDesiredAccess: DWORD;
+  bInheritHandle: BOOL;
+  dwThreadId: DWORD): THandle; stdcall; external 'kernel32.dll';
+
+function NtQueryInformationThread(
+  ThreadHandle: THandle;
+  ThreadInformationClass: DWORD;
+  ThreadInformation: Pointer;
+  ThreadInformationLength: ULONG;
+  ReturnLength: PULONG): NTSTATUS; stdcall; external 'ntdll.dll';
+
+var
+  {$IFDEF CPUX64}
+    LdrLoadDll_Shell: array[0..32] of Byte = (
+      $48, $83, $EC, $28,     // sub rsp, 28h
+      $48, $8B, $01,          // mov rax, [rcx]
+      $4C, $8B, $51, $08,     // mov r10, [rcx+8]
+      $48, $8B, $51, $10,     // mov rdx, [rcx+10h]
+      $4C, $8B, $41, $18,     // mov r8,  [rcx+18h]
+      $4C, $8B, $49, $20,     // mov r9,  [rcx+20h]
+      $4C, $89, $D1,          // mov rcx, r10
+      $FF, $D0,               // call rax
+      $48, $83, $C4, $28,     // add rsp, 28h
+      $C3                     // ret
+    );
+  {$ELSE}
+    LdrLoadDll_Shell: array[0..23] of Byte = (
+      $55,                    // push ebp
+      $89, $E5,               // mov ebp, esp
+      $8B, $55, $08,          // mov edx, [ebp+8]
+      $FF, $72, $10,          // push [edx+10h]
+      $FF, $72, $0C,          // push [edx+0Ch]
+      $FF, $72, $08,          // push [edx+08h]
+      $FF, $72, $04,          // push [edx+04h]
+      $FF, $12,               // call [edx]
+      $C9,                    // leave
+      $C2, $04, $00           // ret 4
+    );
+  {$ENDIF}
+
 type
+  THREAD_BASIC_INFORMATION = record
+    ExitStatus: NTSTATUS;
+    TebBaseAddress: Pointer;
+    ClientId: record
+      UniqueProcess: ULONG_PTR;
+      UniqueThread: ULONG_PTR;
+    end;
+    AffinityMask: ULONG_PTR;
+    Priority: LONG;
+    BasePriority: LONG;
+  end;
+
+  UNICODE_STRING = record
+    Length: USHORT;
+    MaximumLength: USHORT;
+    Buffer: PWideChar;
+  end;
+  PUNICODE_STRING = ^UNICODE_STRING;
+
   TNtCreateThreadEx = function(
     ThreadHandle: PHANDLE;
     DesiredAccess: ACCESS_MASK;
@@ -36,17 +98,30 @@ type
     Unknown2: Pointer;
     Unknown3: Pointer): HRESULT; stdcall;
 
+  TLdrLoadDll = function(
+    DllPath: PWideChar;
+    DllCharacteristics: PULONG;
+    DllName: PUNICODE_STRING;
+    out DllHandle: Pointer): NTSTATUS; stdcall;
+
+  TLdrLoadDll_Wrapper = record
+    LdrLoadDllAddr,
+    DLLPath,
+    DllCharacteristics,
+    DllName,
+    DllHandle: UInt;
+  end;
+
 const
   THREAD_ALL_ACCESS = STANDARD_RIGHTS_REQUIRED or SYNCHRONIZE or $3FF;
-
-function OpenThread(dwDesiredAccess: DWORD; bInheritHandle: BOOL;
-  dwThreadId: DWORD): THandle; stdcall; external kernel32;
 
 constructor TInject.Create(InjectType: INJECT_TYPE; ProcessName, DLLPath: ansistring);
 begin
   FInjectType := InjectType;
   FProcessID  := GetProcessID(string(ProcessName));
   FDLLPath    := DLLPath;
+  WDLLPath    := ExtractFilePath(WideString(DLLPath));
+  WDLLName    := ExtractFileName(WideString(DLLPath));
 end;
 
 function TInject.GetProcessID(ProcessName: string): DWORD;
@@ -96,11 +171,27 @@ end;
 function TInject.InjectDLL: Boolean;
 var
   hProcess, hThread: THandle;
-  pRemoteMemory, pLoadLibrary, pLdrLoadDll: Pointer;
+  pRemoteMemory, pRemoteCode, pLoadLibrary, pLdrLoadDll: Pointer;
   BytesWritten: SIZE_T;
-  ThreadEntry: TThreadEntry32;
-  Snapshot: THandle;
   NtCreateThreadEx: TNtCreateThreadEx;
+
+  // LdrLoad:
+  WUNICODE_STRING: UNICODE_STRING;
+  PWDllPath: Pointer;
+  PWDllName: Pointer;
+  PWDLLHandle: Pointer;
+  PWUNICODE_STRING: Pointer;
+  Wrapper: TLdrLoadDll_Wrapper;
+  PLdrLoadDll_Shell: Pointer;
+  PLdrLoadDll_Params: Pointer;
+
+  // APC:
+  Snapshot: THandle;
+  ThreadEntry: TThreadEntry32;
+  ThreadInfo: THREAD_BASIC_INFORMATION;
+  ThreadAlertable: Byte;
+  Status: NTSTATUS;
+  ReturnLength: ULONG;
 begin
   Result := False;
 
@@ -136,12 +227,18 @@ begin
           pLoadLibrary := GetProcAddress(GetModuleHandle('kernel32.dll'), 'LoadLibraryA');
           if pLoadLibrary = nil then Exit;
 
-          hThread := NtCreateThreadEx(@hThread, MAXIMUM_ALLOWED, nil, hProcess, pLoadLibrary, pRemoteMemory, false, 0, 0, 0, 0);
-          if hThread <> 0 then Exit;
+          hThread := NtCreateThreadEx(@hThread, MAXIMUM_ALLOWED, nil, hProcess, pLoadLibrary, pRemoteMemory, false, 0, nil, nil, nil);
 
+          // Если используется CreateRemoteThread то возвращается дескриптор потока
+          // Если используется NtCreateThreadEx возвращается статус выполнения
+          Result  := hThread = 0;
+
+          // Если использовался CreateRemoteThread мы можем закрыть поток после его выполнения
+          {
           WaitForSingleObject(hThread, INFINITE);
           CloseHandle(hThread);
-          Result := True;
+          }
+
         finally
           VirtualFreeEx(hProcess, pRemoteMemory, 0, MEM_RELEASE);
         end;
@@ -150,25 +247,72 @@ begin
       LdrLoadDll:
       begin
         // Для инжекта во всем лучше, чем LoadLibrary, но требует указания полного пути к .dll файлу
+        // Для передачи параметров в NtCreateThreadEx используется шелл LdrLoadDll_Shell (x86\x64)
 
         pLdrLoadDll := GetProcAddress(GetModuleHandle('ntdll.dll'), 'LdrLoadDll');
-        if pLdrLoadDll = nil then Exit;
+        if not Assigned(pLdrLoadDll) then Exit;
 
-        pRemoteMemory := VirtualAllocEx(hProcess, nil, Length(FDLLPath), MEM_COMMIT or MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if pRemoteMemory = nil then Exit;
-
+        PWDllPath := VirtualAllocEx(hProcess, nil, Length(WDllPath) * SizeOf(WCHAR) + 1, MEM_COMMIT or MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if not Assigned(PWDllPath) then Exit;
         try
-          if not WriteProcessMemory(hProcess, pRemoteMemory, PAnsiChar(FDLLPath), Length(FDLLPath), BytesWritten) then Exit;
+          if not WriteProcessMemory(hProcess, PWDllPath, PWideChar(WDllPath), Length(WDllPath) * SizeOf(WCHAR), BytesWritten) then Exit;
 
-          //hThread := CreateRemoteThread(hProcess, nil, 0, pLdrLoadDll, pRemoteMemory, 0, dwThreadId);
-          hThread := NtCreateThreadEx(@hThread, MAXIMUM_ALLOWED, nil, hProcess, pLdrLoadDll, pRemoteMemory, false, 0, 0, 0, 0);
-          if hThread <> 0 then Exit;
+          PWDllName := VirtualAllocEx(hProcess, nil, Length(WDllName) * SizeOf(WCHAR) + 1, MEM_COMMIT or MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+          if not Assigned(PWDllName) then Exit;
+          try
+            if not WriteProcessMemory(hProcess, PWDllName, PWideChar(WDllName), Length(WDllName) * SizeOf(WCHAR), BytesWritten) then Exit;
 
-          WaitForSingleObject(hThread, INFINITE);
-          CloseHandle(hThread);
-          Result := True;
+            WUNICODE_STRING.Length        := Length(WDllName) * SizeOf(WCHAR);
+            WUNICODE_STRING.MaximumLength := WUNICODE_STRING.Length + 2;
+            WUNICODE_STRING.Buffer        := PWDllName;
+
+            PWUNICODE_STRING := VirtualAllocEx(hProcess, nil, SizeOf(UNICODE_STRING), MEM_COMMIT or MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if not Assigned(PWUNICODE_STRING) then Exit;
+            try
+              if not WriteProcessMemory(hProcess, PWUNICODE_STRING, @WUNICODE_STRING, SizeOf(UNICODE_STRING), BytesWritten) then Exit;
+
+              PWDLLHandle := VirtualAllocEx(hProcess, nil, SizeOf(HMODULE), MEM_COMMIT or MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+              if not Assigned(PWDLLHandle) then Exit;
+              try
+                Wrapper.LdrLoadDllAddr     := UInt(pLdrLoadDll);
+                Wrapper.DLLPath            := UInt(PWDllPath);
+                Wrapper.DllCharacteristics := UInt(nil);
+                Wrapper.DllName            := UInt(PWUNICODE_STRING);
+                Wrapper.DllHandle          := UInt(PWDLLHandle);
+
+                PLdrLoadDll_Params := VirtualAllocEx(hProcess, nil, SizeOf(TLdrLoadDll_Wrapper), MEM_COMMIT or MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                if not Assigned(PLdrLoadDll_Params) then Exit;
+                try
+                  if not WriteProcessMemory(hProcess, PLdrLoadDll_Params, @Wrapper, SizeOf(TLdrLoadDll_Wrapper), BytesWritten) then Exit;
+
+                  PLdrLoadDll_Shell := VirtualAllocEx(hProcess, nil, SizeOf(LdrLoadDll_Shell), MEM_COMMIT or MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                  if not Assigned(PLdrLoadDll_Shell) then Exit;
+                  try
+                    if not WriteProcessMemory(hProcess, PLdrLoadDll_Shell, @LdrLoadDll_Shell, SizeOf(LdrLoadDll_Shell), BytesWritten) then Exit;
+
+                    try
+                      hThread := NtCreateThreadEx(@hThread, MAXIMUM_ALLOWED, nil, hProcess, PLdrLoadDll_Shell, PLdrLoadDll_Params, false, 0, nil, nil, nil);
+                      if hThread <> 0 then Exit;
+                    finally
+                      Result := True;
+                    end;
+                  finally
+                    VirtualFreeEx(hProcess, PLdrLoadDll_Shell, 0, MEM_RELEASE);
+                  end;
+                finally
+                  VirtualFreeEx(hProcess, PLdrLoadDll_Params, 0, MEM_RELEASE);
+                end;
+              finally
+                VirtualFreeEx(hProcess, PWDLLHandle, 0, MEM_RELEASE);
+              end;
+            finally
+              VirtualFreeEx(hProcess, PWUNICODE_STRING, 0, MEM_RELEASE);
+            end;
+          finally
+            VirtualFreeEx(hProcess, PWDllName, 0, MEM_RELEASE);
+          end;
         finally
-          VirtualFreeEx(hProcess, pRemoteMemory, 0, MEM_RELEASE);
+          VirtualFreeEx(hProcess, PWDllPath, 0, MEM_RELEASE);
         end;
       end;
 
@@ -201,7 +345,7 @@ begin
                 begin
                   try
                     QueueUserAPC(pLoadLibrary, hThread, ULONG_PTR(pRemoteMemory));
-                    Sleep(500);
+                    Sleep(100);
 
                     if IsModuleLoaded(FDLLPath, FProcessID) then
                     begin
